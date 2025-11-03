@@ -1,16 +1,20 @@
 import requests
 import base64
 import os
+import argparse
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
 # === Paramètres ===
 LOG_URL = "https://ct.googleapis.com/logs/us1/argon2026h1"
-OUT_DIR = "./data/raw/"
+
+# Chemin vers le dossier data/raw (un niveau au-dessus de "script")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # -> .../CT_RSA/script/crawler
+OUT_DIR = os.path.join(BASE_DIR, "..", "..", "data", "raw")  # -> .../CT_RSA/data/raw
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# === 1. Récupérer 2 entrées depuis le log ===
-def get_entries(start=0, end=1):
+# === 1. Récupérer une plage d’entrées depuis le log ===
+def get_entries(start, end):
     url = f"{LOG_URL}/ct/v1/get-entries"
     params = {"start": start, "end": end}
     resp = requests.get(url, params=params, timeout=30)
@@ -22,20 +26,18 @@ def get_entries(start=0, end=1):
 def extract_certs_from_entry(entry):
     certs = []
     for field in ("extra_data", "leaf_input"):
-        if field not in entry:
-            continue
-        blob_b64 = entry[field]
+        blob_b64 = entry.get(field)
         if not blob_b64:
             continue
         blob = base64.b64decode(blob_b64)
-        # Heuristique simple : essayer de parser le blob complet
+        # Essayer le blob complet
         try:
             cert = x509.load_der_x509_certificate(blob)
             certs.append(cert)
             continue
         except Exception:
             pass
-        # Sinon essayer de découper (le blob peut contenir plusieurs certs)
+        # Sinon parcourir le blob (peut contenir plusieurs certs)
         i = 0
         while i < len(blob) - 4:
             if blob[i] == 0x30:  # probable début de SEQUENCE ASN.1
@@ -58,19 +60,36 @@ def save_pem(cert, index, subindex):
 
 # === 4. Programme principal ===
 def main():
-    print(f"Fetching first 2 entries from {LOG_URL} ...")
-    entries = get_entries(0, 1)
-    print(f"Received {len(entries)} entries.")
-    total_saved = 0
+    parser = argparse.ArgumentParser(description="Télécharge des certificats depuis le log CT de Google.")
+    parser.add_argument("--count", type=int, default=2, help="Nombre de certificats à récupérer (défaut: 2)")
+    args = parser.parse_args()
 
-    for i, e in enumerate(entries):
-        certs = extract_certs_from_entry(e)
-        for j, cert in enumerate(certs):
-            path = save_pem(cert, i, j)
-            print(f"[{path}]")
-            print("  Subject:", cert.subject.rfc4514_string())
-            print("  Issuer :", cert.issuer.rfc4514_string())
-            total_saved += 1
+    count = args.count
+    print(f"Fetching first {count} entries from {LOG_URL} ...")
+
+    total_saved = 0
+    batch_size = 1000  # on limite les requêtes par lot (API CT n’aime pas les grandes plages)
+    start = 0
+
+    while total_saved < count:
+        end = min(start + batch_size - 1, start + (count - total_saved) - 1)
+        entries = get_entries(start, end)
+        print(f"➡️ Fetched entries {start} to {end} ({len(entries)} entries)")
+
+        for i, e in enumerate(entries, start=start):
+            certs = extract_certs_from_entry(e)
+            for j, cert in enumerate(certs):
+                path = save_pem(cert, i, j)
+                print(f"[{path}]")
+                print("  Subject:", cert.subject.rfc4514_string())
+                print("  Issuer :", cert.issuer.rfc4514_string())
+                total_saved += 1
+                if total_saved >= count:
+                    break
+            if total_saved >= count:
+                break
+
+        start = end + 1
 
     print(f"\n✅ Done. Saved {total_saved} certificate(s) in '{OUT_DIR}/'.")
 

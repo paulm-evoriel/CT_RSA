@@ -2,6 +2,12 @@
 
 .\.venv\Scripts\Activate.ps1
 
+python et le nom du fichier
+
+pour fetch_ct.py || python fetch_ct.py --count {le nombre que l'on veut}
+
+deactivate
+
 Certificats, web et calculs de clés privées
 — Récupérer au moins 1 million de certificats en utilisant Certificate Transparency en écrivant un crawler
 et en téléchargeant les certificats de la PKI Certificate Transparancy utilisant les API publiques

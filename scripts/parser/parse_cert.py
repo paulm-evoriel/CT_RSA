@@ -4,8 +4,12 @@ from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.backends import default_backend
 
-RAW_DIR = "./data/raw/"
-OUT_FILE = "./data/parsed/certs_info.csv"
+# === Chemins relatifs au dossier du script ===
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # -> .../CT_RSA/script/crawler
+DATA_DIR = os.path.join(BASE_DIR, "..", "..", "data")  # -> .../CT_RSA/data
+
+RAW_DIR = os.path.join(DATA_DIR, "raw")
+OUT_FILE = os.path.join(DATA_DIR, "parsed", "certs_info.csv")
 
 def extract_rsa_info(cert_path):
     try:
@@ -24,7 +28,7 @@ def extract_rsa_info(cert_path):
                 "key_size": public_key.key_size
             }
     except Exception:
-        # On ignore les certificats non RSA ou invalides
+        # Ignore les certificats non RSA ou corrompus
         return None
 
 def main():
