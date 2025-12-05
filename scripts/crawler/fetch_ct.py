@@ -1,97 +1,172 @@
-import requests
-import base64
-import os
-import argparse
-from cryptography import x509
-from cryptography.hazmat.primitives import serialization
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+fetch_ct.py — version robuste
+- vérifie tree_size via get-sth
+- télécharge par batches (get-entries?start=S&end=E)
+- retries + backoff
+- checkpoint & sharding
+"""
 
-# === Paramètres ===
-LOG_URL = "https://ct.googleapis.com/logs/us1/argon2026h1"
+import asyncio
+import aiohttp
+import json
+import gzip
+import logging
+import math
+import time
+from pathlib import Path
 
-# Chemin vers le dossier data/raw (un niveau au-dessus de "script")
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # -> .../CT_RSA/script/crawler
-OUT_DIR = os.path.join(BASE_DIR, "..", "..", "data", "raw")  # -> .../CT_RSA/data/raw
-os.makedirs(OUT_DIR, exist_ok=True)
+# === Configuration ===
+CT_LOG_URL = "https://ct.googleapis.com/logs/argon2024"  # base URL du log
+SHARD_SIZE = 500       # nombre d'entrées par shard (pour fichiers de sortie)
+BATCH_SIZE = 100            # nombre d'entries demandées par requête get-entries
+CONCURRENCY = 6             # nombre max de requêtes HTTP concurrentes
+MAX_RETRIES = 5
+STATE_FILE = Path("data/state.json")
+OUTPUT_DIR = Path("data/raw")
+LOG_FILE = Path("data/logs/fetch.log")
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
-# === 1. Récupérer une plage d’entrées depuis le log ===
-def get_entries(start, end):
-    url = f"{LOG_URL}/ct/v1/get-entries"
-    params = {"start": start, "end": end}
-    resp = requests.get(url, params=params, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("entries", [])
+# Logging
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
-# === 2. Extraire les certificats DER des blobs Base64 ===
-def extract_certs_from_entry(entry):
-    certs = []
-    for field in ("extra_data", "leaf_input"):
-        blob_b64 = entry.get(field)
-        if not blob_b64:
-            continue
-        blob = base64.b64decode(blob_b64)
-        # Essayer le blob complet
+# === Helpers état ===
+def load_state():
+    if STATE_FILE.exists():
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"next_index": 0}
+
+def save_state(state):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+# === Interroger get-sth pour connaître la taille actuelle du log ===
+async def get_tree_size(session):
+    url = f"{CT_LOG_URL}/ct/v1/get-sth"
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                j = await resp.json()
+                ts = j.get("tree_size")
+                logging.info(f"tree_size obtenu : {ts}")
+                return int(ts)
+            else:
+                logging.error(f"get-sth returned HTTP {resp.status}")
+                return None
+    except Exception as e:
+        logging.error(f"Exception get-sth: {e}")
+        return None
+
+# === Requête get-entries pour une plage start..end with retries/backoff ===
+async def fetch_entries_range(session, start, end):
+    url = f"{CT_LOG_URL}/ct/v1/get-entries?start={start}&end={end}"
+    backoff = 1.0
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            cert = x509.load_der_x509_certificate(blob)
-            certs.append(cert)
-            continue
-        except Exception:
-            pass
-        # Sinon parcourir le blob (peut contenir plusieurs certs)
-        i = 0
-        while i < len(blob) - 4:
-            if blob[i] == 0x30:  # probable début de SEQUENCE ASN.1
-                try:
-                    cert = x509.load_der_x509_certificate(blob[i:])
-                    certs.append(cert)
-                    break
-                except Exception:
-                    pass
-            i += 1
-    return certs
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    j = await resp.json()
+                    entries = j.get("entries", [])
+                    return entries
+                elif resp.status == 404:
+                    # 404 : endpoint ok mais pas trouvé ; peut signifier que la plage est hors tree_size
+                    logging.warning(f"404 pour plage {start}-{end}")
+                    return None
+                else:
+                    logging.warning(f"HTTP {resp.status} pour {start}-{end} (attempt {attempt})")
+        except Exception as e:
+            logging.warning(f"Exception fetch {start}-{end} (attempt {attempt}): {e}")
+        # backoff
+        await asyncio.sleep(backoff)
+        backoff *= 2
+    logging.error(f"Échec après {MAX_RETRIES} tentatives pour {start}-{end}")
+    return None
 
-# === 3. Sauvegarder les certificats au format PEM ===
-def save_pem(cert, index, subindex):
-    pem = cert.public_bytes(serialization.Encoding.PEM)
-    path = os.path.join(OUT_DIR, f"cert_{index}_{subindex}.pem")
-    with open(path, "wb") as f:
-        f.write(pem)
-    return path
+# === Téléchargement d'un bloc (shard) complet en batches concurrents ===
+async def fetch_shard(session, shard_start, shard_end, semaphore):
+    """
+    Télécharge les entrées [shard_start, shard_end) en faisant des requêtes par BATCH_SIZE
+    retourne la liste d'objets entry (mêmes structures que get-entries)
+    """
+    tasks = []
+    results = []
 
-# === 4. Programme principal ===
-def main():
-    parser = argparse.ArgumentParser(description="Télécharge des certificats depuis le log CT de Google.")
-    parser.add_argument("--count", type=int, default=2, help="Nombre de certificats à récupérer (défaut: 2)")
-    args = parser.parse_args()
+    async def worker(s, e):
+        async with semaphore:
+            entries = await fetch_entries_range(session, s, e)
+            if entries:
+                results.extend([{"index": s + i, "entry": ent} for i, ent in enumerate(entries)])
+            # si None, on ignore — on loggue déjà dans fetch_entries_range
 
-    count = args.count
-    print(f"Fetching first {count} entries from {LOG_URL} ...")
+    # découpage en batches
+    for s in range(shard_start, shard_end, BATCH_SIZE):
+        e = min(s + BATCH_SIZE - 1, shard_end - 1)
+        tasks.append(asyncio.create_task(worker(s, e)))
 
-    total_saved = 0
-    batch_size = 1000  # on limite les requêtes par lot (API CT n’aime pas les grandes plages)
-    start = 0
+    if tasks:
+        await asyncio.gather(*tasks)
+    return results
 
-    while total_saved < count:
-        end = min(start + batch_size - 1, start + (count - total_saved) - 1)
-        entries = get_entries(start, end)
-        print(f"➡️ Fetched entries {start} to {end} ({len(entries)} entries)")
+# === Main ===
+async def main():
+    state = load_state()
+    start_index = state.get("next_index", 0)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-        for i, e in enumerate(entries, start=start):
-            certs = extract_certs_from_entry(e)
-            for j, cert in enumerate(certs):
-                path = save_pem(cert, i, j)
-                print(f"[{path}]")
-                print("  Subject:", cert.subject.rfc4514_string())
-                print("  Issuer :", cert.issuer.rfc4514_string())
-                total_saved += 1
-                if total_saved >= count:
-                    break
-            if total_saved >= count:
-                break
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+        tree_size = await get_tree_size(session)
+        if tree_size is None:
+            logging.error("Impossible d'obtenir tree_size — arrêt.")
+            return
 
-        start = end + 1
+        sem = asyncio.Semaphore(CONCURRENCY)
 
-    print(f"\n✅ Done. Saved {total_saved} certificate(s) in '{OUT_DIR}/'.")
+        while start_index < min(tree_size, 1_000):
+            shard_id = start_index // SHARD_SIZE
+            shard_dir = OUTPUT_DIR / f"shard_{shard_id:04d}"
+            shard_dir.mkdir(parents=True, exist_ok=True)
+
+            shard_end = min(start_index + SHARD_SIZE, tree_size, 1_000)
+            logging.info(f"Téléchargement shard {shard_id} [{start_index}–{shard_end})")
+
+            # fetch shard in batches
+            entries = await fetch_shard(session, start_index, shard_end, sem)
+
+            if not entries:
+                logging.warning(f"Aucune entrée récupérée pour shard {shard_id} [{start_index}-{shard_end}) — avancer et continuer")
+                # avancer quand même pour éviter boucle infinie
+                start_index = shard_end
+                state["next_index"] = start_index
+                save_state(state)
+                continue
+
+            # écriture gzip JSONL (on écrit les "entry" bruts)
+            output_file = shard_dir / f"certs_{start_index:08d}_{shard_end:08d}.jsonl.gz"
+            with gzip.open(output_file, "wt", encoding="utf-8") as gz:
+                # entries peut être hors d'ordre selon l'assemblage, on trie par index
+                entries_sorted = sorted(entries, key=lambda x: x["index"])
+                for e in entries_sorted:
+                    # e['entry'] est l'objet retourné par l'API (leaf_input, extra_data ...)
+                    out = {"index": e["index"], **e["entry"]}
+                    gz.write(json.dumps(out, ensure_ascii=False) + "\n")
+
+            logging.info(f"Shard {shard_id} terminé — {len(entries)} entrées écrites -> {output_file}")
+            start_index = shard_end
+            state["next_index"] = start_index
+            save_state(state)
+
+            # Optional short sleep to be gentil avec le serveur
+            await asyncio.sleep(0.1)
+
+        logging.info("Fin du téléchargement (atteint tree_size ou 1_000_000)")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
