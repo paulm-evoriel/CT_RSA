@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fetch_ct.py — version robuste
-- verifie tree_size via get-sth
-- telecharge par batches (get-entries?start=S&end=E)
-- retries + backoff
-- checkpoint & sharding
+fetch_ct.py — version "Robust & Best Effort"
+- Ne s'arrête PAS s'il manque des données.
+- Prend tout ce que le serveur renvoie et continue.
+- Idéal pour récupérer 1M de certs même si le serveur limite la pagination.
 """
 
 import asyncio
@@ -13,33 +12,37 @@ import aiohttp
 import json
 import gzip
 import logging
-import math
 import time
+import random
 from pathlib import Path
 
 # === Configuration ===
-# Calcul du chemin racine du projet (remonte depuis scripts/crawler/ vers la racine)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
-CT_LOG_URL = "https://ct.googleapis.com/logs/us1/argon2024"  # base URL du log
-SHARD_SIZE = 500       # nombre d'entrees par shard (pour fichiers de sortie)
-BATCH_SIZE = 100            # nombre d'entries demandees par requête get-entries
-CONCURRENCY = 6             # nombre max de requêtes HTTP concurrentes
-MAX_RETRIES = 5
+CT_LOG_URL = "https://ct.googleapis.com/logs/eu1/xenon2024"
+SHARD_SIZE = 10000          # 1 fichier = 10 000 entrées
+BATCH_SIZE = 256            # Requêtes par blocs de 256
+CONCURRENCY = 16            # Un peu plus de parallélisme
+MAX_RETRIES = 5             # Retries sur erreurs réseau (500, 502...)
+TARGET_TOTAL = 1_000_000    # Objectif final
+
 STATE_FILE = PROJECT_ROOT / "data" / "state.json"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "raw"
 LOG_FILE = PROJECT_ROOT / "logs" / "fetch.log"
-REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=60) # Timeout large
 
 # Logging
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
 )
 
-# === Helpers etat ===
+# === Helpers État ===
 def load_state():
     if STATE_FILE.exists():
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -51,78 +54,114 @@ def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f)
 
-# === Interroger get-sth pour connaître la taille actuelle du log ===
+# === Récupération de la taille de l'arbre ===
 async def get_tree_size(session):
     url = f"{CT_LOG_URL}/ct/v1/get-sth"
-    try:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                j = await resp.json()
-                ts = j.get("tree_size")
-                logging.info(f"tree_size obtenu : {ts}")
-                return int(ts)
-            else:
-                logging.error(f"get-sth returned HTTP {resp.status}")
-                return None
-    except Exception as e:
-        logging.error(f"Exception get-sth: {e}")
-        return None
-
-# === Requête get-entries pour une plage start..end with retries/backoff ===
-async def fetch_entries_range(session, start, end):
-    url = f"{CT_LOG_URL}/ct/v1/get-entries?start={start}&end={end}"
-    backoff = 1.0
-    for attempt in range(1, MAX_RETRIES + 1):
+    for _ in range(3):
         try:
             async with session.get(url) as resp:
                 if resp.status == 200:
                     j = await resp.json()
-                    entries = j.get("entries", [])
-                    # L'API peut retourner moins d'entrees que demandees si certaines n'existent pas
-                    if len(entries) < (end - start + 1):
-                        logging.debug(f"Plage {start}-{end}: {len(entries)} entrees recuperees sur {end - start + 1} demandees")
-                    return entries
-                elif resp.status == 404:
-                    # 404 : la plage n'existe pas dans le log (probablement hors tree_size ou indices invalides)
-                    logging.debug(f"404 pour plage {start}-{end} (plage inexistante)")
-                    return []  # Retourner liste vide au lieu de None pour indiquer "pas d'entrees"
-                else:
-                    logging.warning(f"HTTP {resp.status} pour {start}-{end} (attempt {attempt})")
+                    return int(j.get("tree_size", 0))
         except Exception as e:
-            logging.warning(f"Exception fetch {start}-{end} (attempt {attempt}): {e}")
-        # backoff
-        await asyncio.sleep(backoff)
-        backoff *= 2
-    logging.error(f"echec après {MAX_RETRIES} tentatives pour {start}-{end}")
-    return []  # Retourner liste vide au lieu de None
+            logging.warning(f"Erreur get-sth: {e}")
+            await asyncio.sleep(1)
+    return None
 
-# === Telechargement d'un bloc (shard) complet en batches concurrents ===
-async def fetch_shard(session, shard_start, shard_end, semaphore):
+# === Fetch d'une plage (Batch) avec Retries Réseau seulement ===
+async def fetch_entries_range(session, start, end):
+    url = f"{CT_LOG_URL}/ct/v1/get-entries?start={start}&end={end}"
+    backoff = 0.5
+    
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            logging.debug(f"Req {start}-{end} attempt {attempt} -> {url}")
+            async with session.get(url) as resp:
+                status = resp.status
+                if status == 200:
+                    j = await resp.json()
+                    entries = j.get("entries", [])
+                    logging.debug(f"HTTP 200 {start}-{end}: {len(entries)} entries returned")
+                    return entries # On retourne ce qu'on a reçu, même si incomplet
+                elif status in [429, 500, 502, 503]:
+                    logging.warning(f"HTTP {status} pour {start}-{end}. Retry...")
+                else:
+                    logging.warning(f"Erreur HTTP {status} pour {start}-{end} - ignoré.")
+                    return [] # Erreur non fatale, on renvoie vide
+        except Exception as e:
+            logging.warning(f"Exception réseau {start}-{end}: {e}")
+        
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 1.5, 10)
+    
+    logging.error(f"Abandon batch {start}-{end} après {MAX_RETRIES} essais réseau.")
+    return []
+
+# === Fetch d'un SHARD en mode "Best Effort" ===
+async def fetch_shard_robust(session, shard_start, shard_end, semaphore):
     """
-    Telecharge les entrees [shard_start, shard_end) en faisant des requêtes par BATCH_SIZE
-    retourne la liste d'objets entry (mêmes structures que get-entries)
+    Télécharge tout ce qui est possible dans la plage [shard_start, shard_end).
+    Ne s'arrête pas si des trous sont détectés.
     """
     tasks = []
-    results = []
+    
+    # 1. Préparation des tâches
+    for s in range(shard_start, shard_end, BATCH_SIZE):
+        e = min(s + BATCH_SIZE - 1, shard_end - 1)
+        tasks.append((s, e))
+
+    all_entries = [] # Liste plate de toutes les entrées récupérées
 
     async def worker(s, e):
         async with semaphore:
-            entries = await fetch_entries_range(session, s, e)
-            if entries:
-                # Assigner les indices correctement : les entrees retournees correspondent
-                # aux indices demandes, mais l'API peut en retourner moins si certaines n'existent pas
-                # On assigne les indices de manière sequentielle a partir de s
-                results.extend([{"index": s + i, "entry": ent} for i, ent in enumerate(entries)])
-            # Si entries est une liste vide, c'est normal (plage inexistante), on continue
+            # Mode adaptatif : on avance l'index courant de la taille renvoyée
+            results = []
+            cur = s
+            expected = e - s + 1
 
-    # decoupage en batches
-    for s in range(shard_start, shard_end, BATCH_SIZE):
-        e = min(s + BATCH_SIZE - 1, shard_end - 1)
-        tasks.append(asyncio.create_task(worker(s, e)))
+            while cur <= e:
+                # léger jitter pour casser l'alignement des requêtes
+                await asyncio.sleep(random.uniform(0, 0.05))
+                entries_raw = await fetch_entries_range(session, cur, e)
+                if not entries_raw:
+                    logging.debug(f"Aucun résultat pour {cur}-{e}, arrêt local du worker")
+                    break
 
-    if tasks:
-        await asyncio.gather(*tasks)
-    return results
+                # Ajouter les entrées récupérées en respectant la borne e
+                for i, entry_data in enumerate(entries_raw):
+                    idx = cur + i
+                    if idx > e:
+                        break
+                    results.append({"index": idx, **entry_data})
+
+                got = len(entries_raw)
+                logging.debug(f"Adaptive chunk {cur}-{e}: got {got} (accumulé {len(results)}/{expected})")
+
+                # Avancer
+                cur += got
+
+                # Sécurité anti-boucle : si le serveur renvoie 0 (déjà géré) ou ne progresse
+                if got == 0:
+                    break
+
+            logging.debug(f"Batch adaptatif {s}-{e}: {len(results)}/{expected} reconstruits")
+            if len(results) < expected:
+                logging.debug(f"Batch partiel adaptatif {s}-{e}: {len(results)}/{expected} reçus (continu...)")
+
+            return results
+
+    # 2. Exécution parallèle
+    futures = [asyncio.create_task(worker(s, e)) for s, e in tasks]
+    batch_results_list = await asyncio.gather(*futures)
+
+    # 3. Assemblage
+    for res in batch_results_list:
+        all_entries.extend(res)
+
+    # 4. Tri final par index pour avoir un fichier propre
+    all_entries.sort(key=lambda x: x["index"])
+    
+    return all_entries
 
 # === Main ===
 async def main():
@@ -130,57 +169,58 @@ async def main():
     start_index = state.get("next_index", 0)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    logging.info(f"Démarrage. Index actuel: {start_index}. Objectif: {TARGET_TOTAL}")
+
     async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
         tree_size = await get_tree_size(session)
-        if tree_size is None:
-            logging.error("Impossible d'obtenir tree_size — arrêt.")
+        if not tree_size:
+            logging.error("Impossible de contacter le serveur.")
             return
-
+        
+        logging.info(f"Taille du log: {tree_size}")
+        limit_index = min(tree_size, TARGET_TOTAL)
+        
         sem = asyncio.Semaphore(CONCURRENCY)
 
-        while start_index < min(tree_size, 1_000):
+        while start_index < limit_index:
+            shard_end = min(start_index + SHARD_SIZE, limit_index)
             shard_id = start_index // SHARD_SIZE
-            shard_dir = OUTPUT_DIR / f"shard_{shard_id:04d}"
-            shard_dir.mkdir(parents=True, exist_ok=True)
-
-            shard_end = min(start_index + SHARD_SIZE, tree_size, 1_000)
-            logging.info(f"Telechargement shard {shard_id} [{start_index}–{shard_end})")
-
-            # fetch shard in batches
-            entries = await fetch_shard(session, start_index, shard_end, sem)
-
-            expected_count = shard_end - start_index
-            actual_count = len(entries)
             
-            if actual_count == 0:
-                logging.warning(f"Aucune entree recuperee pour shard {shard_id} [{start_index}-{shard_end}) — avancer et continuer")
-                # avancer quand même pour eviter boucle infinie
+            logging.info(f"Traitement Shard {shard_id} [{start_index}-{shard_end}]...")
+
+            # Récupération (ne renvoie jamais None, au pire une liste partielle)
+            entries = await fetch_shard_robust(session, start_index, shard_end, sem)
+
+            count = len(entries)
+            expected = shard_end - start_index
+            
+            if count == 0:
+                logging.warning(f"Shard {shard_id} VIDE ! (Réseau HS ou fin du log?). On avance quand même.")
+            elif count < expected:
+                logging.info(f"Shard {shard_id} incomplet: {count}/{expected} entrées récupérées. Sauvegarde en cours...")
+            else:
+                logging.info(f"Shard {shard_id} complet ({count} entrées).")
+
+            # Sauvegarde
+            output_file = OUTPUT_DIR / f"shard_{shard_id:04d}_{start_index:08d}_{shard_end:08d}.jsonl.gz"
+            try:
+                with gzip.open(output_file, "wt", encoding="utf-8") as gz:
+                    for e in entries:
+                        gz.write(json.dumps(e, ensure_ascii=False) + "\n")
+                
+                # On valide et on passe au suivant
                 start_index = shard_end
                 state["next_index"] = start_index
                 save_state(state)
-                continue
-            elif actual_count < expected_count:
-                logging.info(f"Shard {shard_id}: {actual_count}/{expected_count} entrees recuperees (certaines plages n'existent peut-être pas dans le log)")
+                
+            except Exception as e:
+                logging.error(f"Erreur d'écriture disque: {e}")
+                break
 
-            # ecriture gzip JSONL (on ecrit les "entry" bruts)
-            output_file = shard_dir / f"certs_{start_index:08d}_{shard_end:08d}.jsonl.gz"
-            with gzip.open(output_file, "wt", encoding="utf-8") as gz:
-                # entries peut être hors d'ordre selon l'assemblage, on trie par index
-                entries_sorted = sorted(entries, key=lambda x: x["index"])
-                for e in entries_sorted:
-                    # e['entry'] est l'objet retourne par l'API (leaf_input, extra_data ...)
-                    out = {"index": e["index"], **e["entry"]}
-                    gz.write(json.dumps(out, ensure_ascii=False) + "\n")
-
-            logging.info(f"Shard {shard_id} termine — {len(entries)} entrees ecrites -> {output_file}")
-            start_index = shard_end
-            state["next_index"] = start_index
-            save_state(state)
-
-            # Optional short sleep to be gentil avec le serveur
-            await asyncio.sleep(0.1)
-
-        logging.info("Fin du telechargement (atteint tree_size ou 1_000_000)")
+    logging.info("Script terminé.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Arrêt manuel par l'utilisateur.")

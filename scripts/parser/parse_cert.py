@@ -1,188 +1,170 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-parse_cert.py — version scalable
-Lit les fichiers .jsonl.gz produits par fetch_ct.py,
-extrait les cles RSA et les enregistre dans un fichier Parquet.
+parse_cert.py — Extracteur RSA Correctif Final
 """
 
-import os
 import gzip
 import json
 import base64
 import hashlib
 import logging
 from pathlib import Path
-from cryptography import x509
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-import polars as pl  # rapide, compatible parquet
+from asn1crypto import x509
+import polars as pl
 
-# === Configuration ===
-# Calcul du chemin racine du projet (remonte depuis scripts/parser/ vers la racine)
-PROJECT_ROOT = Path(__file__).parent.parent.parent
+# ================= CONFIG =================
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "parsed"
-OUTPUT_FILE = OUTPUT_DIR / "certs.parquet"
-LOG_FILE = PROJECT_ROOT / "logs" / "parse.log"
+LOG_FILE = PROJECT_ROOT / "logs" / "parse_final.log"
 
-# === Logging ===
+# ================= LOGGING =================
+
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
-    filename=LOG_FILE,
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()],
 )
 
-# === Utils ===
-def modulus_sha256(n: int) -> str:
+# ================= UTILS =================
+
+# OIDs pour RSA
+OID_RSA_ENCRYPTION = "1.2.840.113549.1.1.1"
+OID_RSA_PKCS1 = "1.2.840.113549.1.1.11"
+
+def sha256_modulus(n: int) -> str:
     b = n.to_bytes((n.bit_length() + 7) // 8, "big")
     return hashlib.sha256(b).hexdigest()
 
-def safe_b64decode(data: str) -> bytes:
-    """Corrige le padding Base64 si necessaire."""
-    data += '=' * (-len(data) % 4)
-    return base64.b64decode(data)
-
-def parse_certificate_from_entry(entry: dict):
-    """
-    Essaie de decoder un certificat X.509 a partir d'une entree CT.
-    Pour X509Entry, le certificat est dans extra_data (format TLS certificate_list).
-    Format extra_data pour X509Entry:
-    - 3 bytes: longueur totale
-    - 3 bytes: longueur de la certificate_list
-    - Pour chaque certificat: 3 bytes (longueur) + certificat DER
-    Retourne un dict avec les infos importantes, ou None si erreur.
-    """
+def extract_rsa_safe(asn1_obj, index_ref):
+    """Extrait la clé RSA avec les bons noms de champs asn1crypto."""
     try:
-        # Decoder extra_data qui contient la chaîne de certificats
-        extra_data = safe_b64decode(entry["extra_data"])
+        # 1. On récupère la structure SubjectPublicKeyInfo
+        spki = asn1_obj["subject_public_key_info"]
         
-        if len(extra_data) < 6:
-            return None
-        
-        # Format TLS Certificate: 
-        # - 3 bytes: longueur totale (uint24)
-        # - 3 bytes: longueur de la certificate_list (uint24)
-        # - Les certificats suivent directement en DER (sans prefixe de longueur individuelle)
-        total_length = int.from_bytes(extra_data[0:3], byteorder='big')
-        cert_list_length = int.from_bytes(extra_data[3:6], byteorder='big')
-        
-        if len(extra_data) < 6 + cert_list_length:
-            return None
-        
-        # Le premier certificat commence a l'offset 6
-        # Les certificats sont en format DER directement (pas de prefixe de longueur)
-        # Le format DER commence par 0x30 (SEQUENCE)
-        offset = 6
-        
-        if offset >= len(extra_data):
-            return None
-        
-        # Le certificat DER commence directement ici
-        # On doit parser la longueur depuis le format ASN.1 DER
-        if extra_data[offset] != 0x30:  # SEQUENCE tag
-            return None
-        
-        # Parser la longueur ASN.1 DER pour obtenir la taille complète du certificat
-        cert_start = offset
-        offset += 1  # Skip SEQUENCE tag (0x30)
-        
-        if offset >= len(extra_data):
-            return None
-        
-        # Lire la longueur (peut être sur 1, 2, 3 ou 4 bytes selon ASN.1)
-        length_byte = extra_data[offset]
-        offset += 1
-        
-        if length_byte & 0x80 == 0:
-            # Longueur courte (1 byte)
-            cert_content_length = length_byte
-            length_header_size = 1
-        else:
-            # Longueur longue (plusieurs bytes)
-            length_bytes_count = length_byte & 0x7F
-            if length_bytes_count == 0 or length_bytes_count > 4:
-                return None
-            if offset + length_bytes_count > len(extra_data):
-                return None
-            cert_content_length = int.from_bytes(extra_data[offset:offset+length_bytes_count], byteorder='big')
-            offset += length_bytes_count
-            length_header_size = 1 + length_bytes_count
-        
-        # Le certificat complet = tag (1) + longueur header (1-5) + contenu
-        cert_total_length = 1 + length_header_size + cert_content_length
-        
-        # Extraire le certificat DER complet
-        if cert_start + cert_total_length > len(extra_data):
-            return None
-        
-        cert_der = extra_data[cert_start:cert_start + cert_total_length]
-        
-        if len(cert_der) == 0:
-            return None
-        
-        # Decoder le certificat X.509
-        cert = x509.load_der_x509_certificate(cert_der)
+        # 2. Vérification de l'algorithme via OID
+        algo_oid = spki["algorithm"]["algorithm"].dotted
+        if algo_oid not in (OID_RSA_ENCRYPTION, OID_RSA_PKCS1):
+            return "ECC"
 
-        pubkey = cert.public_key()
-        if not isinstance(pubkey, rsa.RSAPublicKey):
-            return None  # ignorer non-RSA
-
-        numbers = pubkey.public_numbers()
+        # 3. CORRECTION ICI : Le champ s'appelle 'public_key' dans asn1crypto
+        # et non 'subject_public_key'
+        pub_bits = spki["public_key"].parsed
+        
+        n = pub_bits["modulus"].native
+        e = pub_bits["public_exponent"].native
 
         return {
-            "index": entry["index"],
-            "key_size": pubkey.key_size,
-            "exponent": numbers.e,
-            "modulus_hex": format(numbers.n, "x"),
-            "modulus_sha256": modulus_sha256(numbers.n),
-            "subject": cert.subject.rfc4514_string(),
-            "issuer": cert.issuer.rfc4514_string(),
-            "not_before": cert.not_valid_before.isoformat(),
-            "not_after": cert.not_valid_after.isoformat()
+            "index": index_ref,
+            "key_size": n.bit_length(),
+            "exponent": int(e),
+            "modulus_hex": format(n, "x"),
+            "modulus_sha256": sha256_modulus(n),
         }
     except Exception as e:
-        logging.warning(f"Erreur parsing certificat index {entry.get('index')}: {e}")
-        return None
+        return f"ERROR: {str(e)}"
 
-def process_shard(shard_dir: Path):
-    """Parse tous les fichiers d’un shard donne."""
+def robust_parse_line(blob, index):
+    # Offset standard CT
+    offset = 15
+    
+    # Sécurité : Si l'offset ne pointe pas sur une séquence, on cherche
+    if len(blob) <= offset or blob[offset] != 0x30:
+        offset = blob.find(b'\x30\x82')
+    
+    if offset == -1:
+        return None, "NO_ASN1"
+
+    data = blob[offset:]
+    
+    # Essai 1 : Certificat
+    try:
+        cert = x509.Certificate.load(data)
+        return extract_rsa_safe(cert['tbs_certificate'], index), "CERT"
+    except:
+        pass
+
+    # Essai 2 : TBS (Pre-cert)
+    try:
+        tbs = x509.TbsCertificate.load(data)
+        return extract_rsa_safe(tbs, index), "TBS"
+    except:
+        pass
+
+    return None, "PARSE_FAIL"
+
+def process_shard(path: Path):
     rows = []
-    for file in shard_dir.glob("*.jsonl.gz"):
-        with gzip.open(file, "rt", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                    parsed = parse_certificate_from_entry(entry)
-                    if parsed:
-                        parsed["shard"] = shard_dir.name
-                        rows.append(parsed)
-                except json.JSONDecodeError:
-                    logging.error(f"JSON invalide dans {file}")
-    return rows
+    stats = {"RSA": 0, "ECC": 0, "FAIL": 0}
+    first_error = None
+    
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+                if "leaf_input" not in entry: continue
+                
+                blob = base64.b64decode(entry["leaf_input"])
+                result, _ = robust_parse_line(blob, entry["index"])
+                
+                if isinstance(result, dict):
+                    rows.append(result)
+                    stats["RSA"] += 1
+                elif result == "ECC":
+                    stats["ECC"] += 1
+                else:
+                    stats["FAIL"] += 1
+                    if not first_error and isinstance(result, str) and result.startswith("ERROR"):
+                        first_error = result
+
+            except Exception:
+                stats["FAIL"] += 1
+                continue
+
+    return rows, stats, first_error
+
+# ================= MAIN =================
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    all_rows = []
+    shards = sorted(RAW_DIR.glob("shard_*.jsonl.gz"))
+    
+    if not shards:
+        logging.error("Aucun shard trouve.")
+        return
 
-    shards = sorted(RAW_DIR.glob("shard_*"))
-    logging.info(f"Trouve {len(shards)} shards a traiter")
+    logging.info(f"Traitement de {len(shards)} shards...")
+    total_rsa = 0
 
     for shard in shards:
-        logging.info(f"Traitement de {shard}")
-        rows = process_shard(shard)
+        out_path = OUTPUT_DIR / shard.name.replace(".jsonl.gz", ".parquet")
+        
+        if out_path.exists():
+            continue
+
+        logging.info(f"Lecture de {shard.name}...")
+        rows, stats, err = process_shard(shard)
+
+        logging.info(f" -> RSA: {stats['RSA']} | ECC: {stats['ECC']} | Fail: {stats['FAIL']}")
+        
+        if stats['RSA'] == 0 and err:
+            logging.error(f" [!] EXEMPLE ERREUR : {err}")
+
         if rows:
             df = pl.DataFrame(rows)
-            # Append Parquet (concatenation incrementale)
-            if OUTPUT_FILE.exists():
-                old = pl.read_parquet(OUTPUT_FILE)
-                df = pl.concat([old, df])
-            df.write_parquet(OUTPUT_FILE, compression="zstd")
-            logging.info(f"{len(rows)} certificats ajoutes depuis {shard}")
-        else:
-            logging.info(f"Aucun certificat RSA dans {shard}")
+            df = df.with_columns([
+                pl.col("index").cast(pl.UInt64),
+                pl.col("key_size").cast(pl.UInt16),
+                pl.col("exponent").cast(pl.UInt32),
+            ])
+            df.write_parquet(out_path, compression="zstd")
+            total_rsa += len(rows)
+
+    logging.info(f"--- TERMINE : {total_rsa} RSA extraites ---")
 
 if __name__ == "__main__":
     main()
