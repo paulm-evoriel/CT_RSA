@@ -124,5 +124,15 @@ def main():
         json.dump(report, f, indent=2)
     print(f"\n Rapport sauvé : {out_file}")
 
+    # 2.5 ANALYSE DES TAILLES DE CLÉS (Nouveau)
+    print("\n2.5 Répartition des tailles de clés RSA...")
+    # On groupe par taille de clé et on compte les occurrences
+    size_stats = df.group_by("key_size").count().sort("key_size")
+    
+    for row in size_stats.iter_rows(named=True):
+        count = row["count"]
+        percent = (count / total_keys) * 100
+        print(f"   - {row['key_size']} bits : {count} clés ({percent:.2f}%)")
+
 if __name__ == "__main__":
     main()
